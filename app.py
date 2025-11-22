@@ -46,12 +46,21 @@ def health_check():
 # Inicializa o scheduler quando a aplicação inicia
 # IMPORTANTE: No Render, isso só funciona se o worker estiver sempre ativo
 # Para produção, considere usar um worker separado ou cron jobs do Render
-try:
-    scheduler = init_scheduler(app)
-    logger.info("✅ Aplicação inicializada com scheduler")
-except Exception as e:
-    logger.error(f"❌ Erro ao inicializar scheduler: {e}")
-    scheduler = None
+scheduler = None
+
+def init_app_scheduler():
+    """Inicializa o scheduler de forma segura"""
+    global scheduler
+    try:
+        scheduler = init_scheduler(app)
+        logger.info("✅ Scheduler inicializado com sucesso")
+    except Exception as e:
+        logger.error(f"❌ Erro ao inicializar scheduler: {e}")
+        scheduler = None
+
+# Inicializa o scheduler após a criação do app
+# Isso evita problemas de importação circular
+init_app_scheduler()
 
 if __name__ == '__main__':
     # Em produção (Render), o host deve ser 0.0.0.0
