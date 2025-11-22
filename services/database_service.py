@@ -42,3 +42,43 @@ def get_clients_for_automation() -> tuple:
         return response.data, None
     except Exception as e:
         return None, f"Erro ao buscar clientes: {str(e)}"
+
+
+def update_client_status(client_id: int, novo_status: str) -> tuple:
+    """
+    Atualiza o status de um cliente no banco de dados.
+    
+    Args:
+        client_id: ID do cliente
+        novo_status: Novo status a ser atribuído
+    
+    Returns:
+        Tuple[dict, Optional[str]]: (dados_atualizados, erro)
+    """
+    try:
+        response = supabase.table('clientes').update({
+            'status': novo_status
+        }).eq('id', client_id).execute()
+        
+        if response.data:
+            return response.data[0], None
+        else:
+            return None, "Cliente não encontrado ou nenhuma alteração realizada"
+            
+    except Exception as e:
+        return None, f"Erro ao atualizar status: {str(e)}"
+
+
+def get_all_clients() -> tuple:
+    """
+    Busca todos os clientes do banco de dados.
+    Útil para o dashboard e relatórios.
+    
+    Returns:
+        Tuple[list, Optional[str]]: (lista_de_clientes, erro)
+    """
+    try:
+        response = supabase.table('clientes').select('*').order('created_at', desc=True).execute()
+        return response.data, None
+    except Exception as e:
+        return None, f"Erro ao buscar clientes: {str(e)}"
