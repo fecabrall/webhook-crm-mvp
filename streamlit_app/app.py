@@ -278,11 +278,38 @@ with tabs[0]:
 with tabs[1]:
     st.header("📨 Enviar novo cliente")
     st.markdown("Formulário amigável para cadastrar clientes. O sistema tentará enviar ao backend; se indisponível, salva direto no banco; se necessário, guarda localmente para reenvio automático.")
+    # Tipo de cliente e busca por CPF (fora do form para autocomplete)
+    cliente_tipo = st.radio("Tipo de cliente", ("Novo", "Existente"), index=0, horizontal=True)
+    cpf_search = None
+    prefill = st.session_state.get("prefill_client", {})
+    if cliente_tipo == "Existente":
+        cols_search = st.columns([2,1])
+        cpf_search = cols_search[0].text_input("CPF (apenas números)", value=prefill.get("cpf",""))
+        if cols_search[1].button("Buscar por CPF"):
+            from utils.validators import sanitize_cpf, validate_cpf
+            cpf_digits = sanitize_cpf(cpf_search)
+            ok, err = validate_cpf(cpf_digits)
+            if not ok:
+                st.error(f"CPF inválido: {err}")
+            else:
+                # procura no Supabase por cpf
+                try:
+                    resp = supabase.table('clientes').select('*').eq('cpf', cpf_digits).limit(1).execute()
+                    data = getattr(resp, 'data', None) or []
+                    if data:
+                        client = data[0]
+                        st.session_state['prefill_client'] = client
+                        st.experimental_rerun()
+                    else:
+                        st.info("Cliente não encontrado. Preencha os dados manualmente.")
+                except Exception as e:
+                    st.error(f"Erro na busca: {e}")
+
     with st.form("webhook_form"):
-        cliente_tipo = st.radio("Tipo de cliente", ("Novo", "Existente"), index=0, horizontal=True)
-        nome = st.text_input("Nome completo", "")
-        telefone = st.text_input("Telefone", "")
-        email = st.text_input("Email (opcional)", "")
+        # prefill values if present
+        nome = st.text_input("Nome completo", value=prefill.get("nome",""))
+        telefone = st.text_input("Telefone", value=prefill.get("telefone",""))
+        email = st.text_input("Email (opcional)", value=prefill.get("email",""))
 
         status_options = ["Novo Cliente - 1 compra", "Em follow-up", "Recorrente", "Perdido", "Outro..."]
         status_sel = st.selectbox("Status (padrões)", status_options, index=0)
@@ -291,10 +318,19 @@ with tabs[1]:
         else:
             status = status_sel
 
-        data_compra = st.date_input("Data da primeira compra", value=None)
+        # Data label changes for novo/existente
+        if cliente_tipo == "Novo":
+            data_compra = st.date_input("Data da primeira compra", value=None)
+        else:
+            data_compra = st.date_input("Data desta compra", value=None)
         procedimento = st.text_input("Procedimento", "")
         valor_pago = st.number_input("Valor pago", min_value=0.0, step=0.01, format="%.2f")
-        observacoes = st.text_area("Observações", "")
+        observacoes = st.text_area("Observações", value=prefill.get("observacoes",""))
+
+        # show CPF in form for existing as read-only if prefilled
+        if cliente_tipo == "Existente":
+            cpf_display = prefill.get('cpf', cpf_search or "")
+            st.text_input("CPF (identificador)", value=cpf_display, disabled=True)
 
         st.markdown("---")
         st.subheader("Agendamento")
@@ -331,6 +367,12 @@ with tabs[1]:
             "valor_pago": float(valor_pago) if valor_pago else None,
             "observacoes": observacoes
         }
+
+        # include cpf when available
+        cpf_field = prefill.get('cpf') if prefill.get('cpf') else (cpf_search or None)
+        if cpf_field:
+            from utils.validators import sanitize_cpf
+            payload['cpf'] = sanitize_cpf(cpf_field)
 
         if data_compra:
             payload["data_primeira_compra"] = data_compra.strftime("%d/%m/%Y")
@@ -428,6 +470,37 @@ with tabs[1]:
                         supabase.table('clientes').update({'ultima_acao': agora_iso}).eq('id', client_id).execute()
                 except Exception:
                     pass
+
+        # If existing client and user filled a "data desta compra", create a purchase action and update client summary
+        if client_saved and cliente_tipo == "Existente" and data_compra and not dry_run:
+            try:
+                dt_str = data_compra.strftime('%Y-%m-%d')
+            except Exception:
+                dt_str = None
+            purchase_content = f"Procedimento: {procedimento} | Valor: {valor_pago} | Data: {dt_str}"
+            purchase_action = {
+                'id_cliente': client_id,
+                'tipo': 'compra',
+                'conteudo': purchase_content,
+                'data': agora_iso,
+                'resultado': 'comprou'
+            }
+            try:
+                try_insert_action_supabase(purchase_action)
+            except Exception:
+                pass
+            # update cliente resumo (procedimento, valor_pago, ultima_acao)
+            try:
+                upd = {}
+                if procedimento:
+                    upd['procedimento'] = procedimento
+                if valor_pago:
+                    upd['valor_pago'] = float(valor_pago)
+                upd['ultima_acao'] = agora_iso
+                if upd and client_id:
+                    supabase.table('clientes').update(upd).eq('id', client_id).execute()
+            except Exception:
+                pass
 
         # Feedback amigável
         if client_saved:

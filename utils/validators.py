@@ -133,3 +133,38 @@ def sanitize_email(email: str) -> str:
     
     return email_limpo
 
+
+def sanitize_cpf(cpf: str) -> str:
+    """Remove caracteres não numéricos do CPF e retorna string com 11 dígitos quando possível."""
+    if not cpf:
+        return ""
+    cpf_digits = re.sub(r'\D', '', cpf)
+    return cpf_digits
+
+
+def validate_cpf(cpf: str) -> Tuple[bool, Optional[str]]:
+    """Valida CPF (formato e dígitos verificadores).
+
+    Retorna (True, None) se válido, senão (False, mensagem).
+    """
+    if not cpf:
+        return False, "CPF não pode ser vazio"
+    cpf_digits = sanitize_cpf(cpf)
+    if len(cpf_digits) != 11:
+        return False, "CPF deve ter 11 dígitos"
+    # Elimina CPFs com todos dígitos iguais
+    if cpf_digits == cpf_digits[0] * 11:
+        return False, "CPF inválido"
+
+    def calc_digit(digs):
+        s = sum(int(d) * w for d, w in zip(digs, range(len(digs)+1, 1, -1)))
+        r = (s * 10) % 11
+        return '0' if r == 10 else str(r)
+
+    first9 = cpf_digits[:9]
+    d1 = calc_digit(first9)
+    d2 = calc_digit(first9 + d1)
+    if cpf_digits[-2:] != d1 + d2:
+        return False, "CPF inválido"
+    return True, None
+
