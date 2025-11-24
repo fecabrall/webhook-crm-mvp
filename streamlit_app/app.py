@@ -96,6 +96,39 @@ def try_save_to_supabase(record_payload):
     except Exception as e:
         return False, f"supabase_exception:{e}"
 
+def try_insert_client_supabase(record_payload):
+    """Insere cliente no Supabase e retorna (success, info, record_or_none)"""
+    if not supabase:
+        return False, "no_supabase_client", None
+    try:
+        resp = supabase.table("clientes").insert(record_payload).execute()
+        data = getattr(resp, "data", None)
+        err = getattr(resp, "error", None)
+        if data:
+            return True, "saved_supabase", data[0]
+        if err:
+            return False, f"supabase_error:{err}", None
+        return False, "supabase_unknown", None
+    except Exception as e:
+        return False, f"supabase_exception:{e}", None
+
+
+def try_insert_action_supabase(action_payload):
+    """Insere ação na tabela 'acoes' e retorna (success, info, record_or_none)"""
+    if not supabase:
+        return False, "no_supabase_client", None
+    try:
+        resp = supabase.table("acoes").insert(action_payload).execute()
+        data = getattr(resp, "data", None)
+        err = getattr(resp, "error", None)
+        if data:
+            return True, "saved_action", data[0]
+        if err:
+            return False, f"supabase_error:{err}", None
+        return False, "supabase_unknown", None
+    except Exception as e:
+        return False, f"supabase_exception:{e}", None
+
 def resend_outbox_once(api_base=None, token=None):
     if not os.path.exists(OUTBOX_PATH):
         return {"processed": 0, "left": 0}
@@ -151,6 +184,49 @@ def resend_outbox_once(api_base=None, token=None):
         pass
     return {"processed": processed, "left": len(retained)}
 
+
+def resend_single_outbox_record(rec, api_base=None, token=None):
+    """Try to resend a single outbox record. Returns (success, info)."""
+    payload = rec.get("payload", {})
+    # try backend first
+    if api_base:
+        try:
+            headers = {"Content-Type": "application/json"}
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            r = requests.post(api_base.rstrip("/") + "/api/webhook", json=payload, headers=headers, timeout=8)
+            if r.status_code in (200, 201):
+                return True, "sent_backend"
+        except Exception:
+            pass
+
+    # try direct supabase
+    saved, info, rec_saved = try_insert_client_supabase(payload)
+    if saved:
+        return True, f"saved_supabase:{rec_saved.get('id') if rec_saved else ''}"
+
+    return False, info
+
+
+def remove_outbox_entry_by_index(idx):
+    """Remove a single outbox entry by its index (0-based)."""
+    if not os.path.exists(OUTBOX_PATH):
+        return False
+    try:
+        with open(OUTBOX_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        if idx < 0 or idx >= len(lines):
+            return False
+        del lines[idx]
+        if lines:
+            with open(OUTBOX_PATH, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+        else:
+            os.remove(OUTBOX_PATH)
+        return True
+    except Exception:
+        return False
+
 # Tenta re-enviar uma vez ao iniciar (silencioso)
 API_BASE_START = st.secrets.get("API_BASE_URL") if "API_BASE_URL" in st.secrets else os.getenv("API_BASE_URL", None)
 API_TOKEN_START = st.secrets.get("API_SECRET_TOKEN") if "API_SECRET_TOKEN" in st.secrets else os.getenv("API_SECRET_TOKEN", None)
@@ -161,7 +237,7 @@ if API_BASE_START or supabase:
 
 # --- LAYOUT: Abas ---
 st.title("🚀 Painel de Controle - MVP Automação")
-tabs = st.tabs(["Visão Geral", "Enviar Webhook (form)", "Tarefas / Ações", "Logs / Auditoria"])
+tabs = st.tabs(["Visão Geral", "Enviar Webhook (form)", "Tarefas / Ações", "Pendentes / Outbox", "Logs / Auditoria"])
 
 # ----- ABA 1: Visão Geral -----
 with tabs[0]:
@@ -203,14 +279,41 @@ with tabs[1]:
     st.header("📨 Enviar novo cliente")
     st.markdown("Formulário amigável para cadastrar clientes. O sistema tentará enviar ao backend; se indisponível, salva direto no banco; se necessário, guarda localmente para reenvio automático.")
     with st.form("webhook_form"):
-        nome = st.text_input("Nome", "")
+        cliente_tipo = st.radio("Tipo de cliente", ("Novo", "Existente"), index=0, horizontal=True)
+        nome = st.text_input("Nome completo", "")
         telefone = st.text_input("Telefone", "")
         email = st.text_input("Email (opcional)", "")
+
+        status_options = ["Novo Cliente - 1 compra", "Em follow-up", "Recorrente", "Perdido", "Outro..."]
+        status_sel = st.selectbox("Status (padrões)", status_options, index=0)
+        if status_sel == "Outro...":
+            status = st.text_input("Status personalizado")
+        else:
+            status = status_sel
+
         data_compra = st.date_input("Data da primeira compra", value=None)
         procedimento = st.text_input("Procedimento", "")
         valor_pago = st.number_input("Valor pago", min_value=0.0, step=0.01, format="%.2f")
         observacoes = st.text_area("Observações", "")
-        incluir_ultima_acao = st.checkbox("Incluir campo ultima_acao igual a data da compra (opcional)", value=False)
+
+        st.markdown("---")
+        st.subheader("Agendamento")
+        proxima_manual = st.checkbox("Definir próxima ação manualmente")
+        proxima_acao_dt = None
+        if proxima_manual:
+            proxima_acao_dt = st.datetime_input("Próxima ação (data e hora)", value=None)
+
+        st.markdown("---")
+        st.subheader("Ações imediatas (opcional)")
+        criar_acao = st.checkbox("Criar ação agora para este cliente")
+        acao_tipo = None
+        acao_conteudo = None
+        acao_resultado = "pendente"
+        if criar_acao:
+            acao_tipo = st.selectbox("Tipo de ação", ("ligacao", "mensagem"))
+            acao_conteudo = st.text_area("Conteúdo / Observações da ação")
+            acao_resultado = st.selectbox("Resultado inicial", ("pendente", "sem_resposta", "agendou", "comprou", "sim", "nao"), index=0)
+
         dry_run = st.checkbox("Dry-run (não persiste no DB, devolve payload normalizado)", value=False)
         submitted = st.form_submit_button("Enviar")
 
@@ -218,19 +321,31 @@ with tabs[1]:
         API_BASE = st.secrets.get("API_BASE_URL") if "API_BASE_URL" in st.secrets else os.getenv("API_BASE_URL", "http://localhost:5000")
         TOKEN = st.secrets.get("API_SECRET_TOKEN") if "API_SECRET_TOKEN" in st.secrets else os.getenv("API_SECRET_TOKEN", "")
         url = API_BASE.rstrip("/") + "/api/webhook" if API_BASE else None
+
         payload = {
             "nome": nome,
             "telefone": telefone,
             "email": email,
+            "status": status or "Novo Cliente - 1 compra",
             "procedimento": procedimento,
-            "valor_pago": float(valor_pago) if valor_pago else None
+            "valor_pago": float(valor_pago) if valor_pago else None,
+            "observacoes": observacoes
         }
+
         if data_compra:
             payload["data_primeira_compra"] = data_compra.strftime("%d/%m/%Y")
-        if observacoes:
-            payload["observacoes"] = observacoes
-        if incluir_ultima_acao and data_compra:
-            payload["ultima_acao"] = data_compra.strftime("%d/%m/%Y")
+
+        if proxima_acao_dt:
+            try:
+                payload["proxima_acao"] = proxima_acao_dt.isoformat()
+            except Exception:
+                payload["proxima_acao"] = None
+
+        # Se o usuário marcou criar ação agora, iremos tentar criar ação e atualizar ultima_acao
+        agora_iso = datetime.now().isoformat()
+        if criar_acao and not dry_run:
+            # marca que houve uma ação agora
+            payload["ultima_acao"] = agora_iso
 
         headers = {"Content-Type": "application/json"}
         if TOKEN:
@@ -238,29 +353,39 @@ with tabs[1]:
         if dry_run:
             headers["X-Dry-Run"] = "true"
 
+        # Envio/fluxo
+        client_saved = False
+        client_record = None
+        client_id = None
+
         # 1) tenta enviar ao backend
-        sent_ok = False
-        if url:
+        if url and not dry_run:
             try:
                 resp = requests.post(url, json=payload, headers=headers, timeout=10)
                 if resp.status_code in (200, 201):
-                    st.success("Cliente registrado com sucesso.")
-                    sent_ok = True
+                    client_saved = True
+                    try:
+                        j = resp.json()
+                        client_id = j.get("client_id")
+                    except Exception:
+                        client_id = None
                 else:
                     # backend respondeu com erro -> tenta salvar direto no Supabase
-                    saved, info = try_save_to_supabase(payload)
+                    saved, info, rec = try_insert_client_supabase(payload)
                     if saved:
-                        st.success("Cliente salvo diretamente no banco (fallback).")
-                        sent_ok = True
+                        client_saved = True
+                        client_record = rec
+                        client_id = rec.get("id") if rec else None
                     else:
-                        save_outbox(payload, {"backend_status": resp.status_code, "backend_text": getattr(resp, "text", "") , "fallback_info": info})
+                        save_outbox(payload, {"backend_status": resp.status_code, "backend_text": getattr(resp, "text", ""), "fallback_info": info})
                         st.warning("Recebemos seus dados. Estamos guardando e tentaremos processar em seguida.")
             except ConnectionError:
                 # backend indisponível -> tenta salvar direto no Supabase
-                saved, info = try_save_to_supabase(payload)
+                saved, info, rec = try_insert_client_supabase(payload)
                 if saved:
-                    st.success("Serviço temporariamente indisponível, mas seu cliente foi salvo diretamente no banco.")
-                    sent_ok = True
+                    client_saved = True
+                    client_record = rec
+                    client_id = rec.get("id") if rec else None
                 else:
                     save_outbox(payload, {"error": "connection_refused", "fallback_info": info})
                     st.warning("Serviço temporariamente indisponível. Seus dados foram recebidos e serão processados em breve.")
@@ -270,18 +395,46 @@ with tabs[1]:
             except Exception:
                 save_outbox(payload, {"error": "unexpected"})
                 st.error("Ocorreu um problema. Seus dados foram salvos com segurança e serão verificados.")
+        elif dry_run:
+            st.json({"dry_run": True, "normalized_payload": payload})
+            client_saved = False
         else:
-            # sem URL configurada -> tenta salvar direto no Supabase, senão outbox
-            saved, info = try_save_to_supabase(payload)
+            # sem URL configurada -> tenta salvar direto no Supabase
+            saved, info, rec = try_insert_client_supabase(payload)
             if saved:
-                st.success("Cliente salvo diretamente no banco.")
+                client_saved = True
+                client_record = rec
+                client_id = rec.get("id") if rec else None
             else:
                 save_outbox(payload, {"error": "no_api_url", "fallback_info": info})
                 st.warning("Registro salvo localmente. Configure API_BASE_URL ou verifique conexão para processar.")
 
-        # mostrar resumo amigável e opção de copiar payload
-        if sent_ok:
-            st.experimental_rerun()
+        # Se foi criado/registrado com sucesso e o usuário pediu ação imediata, cria a ação
+        action_created = False
+        if client_saved and criar_acao and not dry_run:
+            action_payload = {
+                "id_cliente": client_id,
+                "tipo": acao_tipo,
+                "conteudo": acao_conteudo,
+                "data": agora_iso,
+                "resultado": acao_resultado
+            }
+            a_saved, a_info, a_rec = try_insert_action_supabase(action_payload)
+            if a_saved:
+                action_created = True
+                # atualiza ultima_acao do cliente se tivermos id
+                try:
+                    if client_id:
+                        supabase.table('clientes').update({'ultima_acao': agora_iso}).eq('id', client_id).execute()
+                except Exception:
+                    pass
+
+        # Feedback amigável
+        if client_saved:
+            msg = "Cliente registrado com sucesso."
+            if action_created:
+                msg += " Ação criada."
+            st.success(msg)
         else:
             with st.expander("Dados enviados (cópia)"):
                 st.code(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -303,6 +456,61 @@ with tabs[2]:
         st.info("Para marcar resultado, use a interface administrativa ou crie endpoints que atualizem `acoes.resultado` via API.")
     else:
         st.info("Nenhuma ação pendente encontrada.")
+
+# ----- ABA 4: Pendentes / Outbox -----
+with tabs[3]:
+    st.header("📥 Pendentes / Outbox")
+    st.markdown("Lista de envios locais que não foram processados. Você pode reenviar individualmente ao backend ou remover entradas.")
+    if not os.path.exists(OUTBOX_PATH):
+        st.info("Nenhum item pendente encontrado.")
+    else:
+        try:
+            with open(OUTBOX_PATH, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except Exception as e:
+            st.error(f"Erro ao ler outbox: {e}")
+            lines = []
+
+        for i, ln in enumerate(lines):
+            try:
+                rec = json.loads(ln)
+            except Exception:
+                rec = {"ts": "?", "payload": {}}
+            ts = rec.get("ts", "?")
+            payload = rec.get("payload", {})
+            title = f"{i} — {ts} — {payload.get('nome', payload.get('telefone',''))}"
+            with st.expander(title, expanded=False):
+                st.json(payload)
+                cols = st.columns([1,1,1])
+                if cols[0].button(f"Reenviar {i}"):
+                    api_base = st.secrets.get("API_BASE_URL") if "API_BASE_URL" in st.secrets else os.getenv("API_BASE_URL", None)
+                    token = st.secrets.get("API_SECRET_TOKEN") if "API_SECRET_TOKEN" in st.secrets else os.getenv("API_SECRET_TOKEN", None)
+                    ok, info = resend_single_outbox_record(rec, api_base=api_base, token=token)
+                    if ok:
+                        removed = remove_outbox_entry_by_index(i)
+                        if removed:
+                            st.success("Reenviado e removido dos pendentes.")
+                        else:
+                            st.success("Reenviado; não foi possível remover o item local (verifique permissões).")
+                        st.experimental_rerun()
+                    else:
+                        st.error(f"Falha ao reenviar: {info}")
+                if cols[1].button(f"Apagar {i}"):
+                    removed = remove_outbox_entry_by_index(i)
+                    if removed:
+                        st.success("Item removido do outbox.")
+                        st.experimental_rerun()
+                    else:
+                        st.error("Falha ao remover o item.")
+                if cols[2].button(f"Salvar como arquivo {i}"):
+                    # export payload as file
+                    fn = f"pending_{i}.json"
+                    try:
+                        with open(fn, "w", encoding="utf-8") as f:
+                            json.dump(payload, f, ensure_ascii=False, indent=2)
+                        st.success(f"Salvo em {fn}")
+                    except Exception as e:
+                        st.error(f"Erro ao salvar arquivo: {e}")
 
 # ----- ABA 4: Logs / Auditoria -----
 with tabs[3]:
