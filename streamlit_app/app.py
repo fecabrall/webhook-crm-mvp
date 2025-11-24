@@ -49,6 +49,15 @@ def pretty_datetime(val):
     except Exception:
         return str(val)
 
+
+def mask_cpf(cpf: str) -> str:
+    if not cpf:
+        return ""
+    s = ''.join([c for c in str(cpf) if c.isdigit()])
+    if len(s) != 11:
+        return s
+    return f"{s[0:3]}.{s[3:6]}.{s[6:9]}-{s[9:11]}"
+
 def days_since(val):
     if not val:
         return None
@@ -249,6 +258,9 @@ with tabs[0]:
                 df_clientes[col + "_pretty"] = df_clientes[col].apply(pretty_datetime)
         if "data_primeira_compra" in df_clientes.columns:
             df_clientes["dias_desde_compra"] = df_clientes["data_primeira_compra"].apply(days_since)
+        # format cpf for display (masked)
+        if 'cpf' in df_clientes.columns:
+            df_clientes['cpf_pretty'] = df_clientes['cpf'].apply(mask_cpf)
         def precisa_acao(row):
             pa = row.get("proxima_acao")
             if not pa:
@@ -267,8 +279,8 @@ with tabs[0]:
         col2.metric("Com próxima ação hoje/atrasada", int((df_clientes['status_acao']=="Hoje / Atrasado").sum()))
         col3.metric("Sem próxima ação", int((df_clientes['status_acao']=="Sem agenda").sum()))
 
-        display_cols = ["id", "nome", "telefone", "status", "data_primeira_compra_pretty",
-                        "dias_desde_compra", "proxima_acao_pretty", "ultima_acao_pretty", "status_acao", "observacoes"]
+        display_cols = ["id", "nome", "cpf_pretty", "telefone", "status", "data_primeira_compra_pretty",
+                "dias_desde_compra", "proxima_acao_pretty", "ultima_acao_pretty", "status_acao", "observacoes"]
         display_cols = [c for c in display_cols if c in df_clientes.columns]
         st.dataframe(df_clientes[display_cols].rename(columns=lambda x: x.replace("_pretty", "")), use_container_width=True)
     else:
@@ -370,6 +382,15 @@ with tabs[1]:
 
         # include cpf when available
         cpf_field = prefill.get('cpf') if prefill.get('cpf') else (cpf_search or None)
+        # validate CPF if present (existing clients require valid CPF)
+        validation_failed = False
+        if cpf_field:
+            from utils.validators import sanitize_cpf, validate_cpf
+            cpf_digits = sanitize_cpf(cpf_field)
+            ok, err = validate_cpf(cpf_digits)
+            if not ok:
+                st.error(f"CPF inválido: {err}")
+                validation_failed = True
         if cpf_field:
             from utils.validators import sanitize_cpf
             payload['cpf'] = sanitize_cpf(cpf_field)
@@ -401,55 +422,60 @@ with tabs[1]:
         client_id = None
 
         # 1) tenta enviar ao backend
-        if url and not dry_run:
-            try:
-                resp = requests.post(url, json=payload, headers=headers, timeout=10)
-                if resp.status_code in (200, 201):
-                    client_saved = True
-                    try:
-                        j = resp.json()
-                        client_id = j.get("client_id")
-                    except Exception:
-                        client_id = None
-                else:
-                    # backend respondeu com erro -> tenta salvar direto no Supabase
+        if validation_failed:
+            st.warning("Corrija o CPF antes de enviar.")
+        else:
+            # dry-run path
+            if dry_run:
+                st.json({"dry_run": True, "normalized_payload": payload})
+                client_saved = False
+            # try backend when configured
+            elif url and not dry_run:
+                try:
+                    resp = requests.post(url, json=payload, headers=headers, timeout=10)
+                    if resp.status_code in (200, 201):
+                        client_saved = True
+                        try:
+                            j = resp.json()
+                            client_id = j.get("client_id")
+                        except Exception:
+                            client_id = None
+                    else:
+                        # backend respondeu com erro -> tenta salvar direto no Supabase
+                        saved, info, rec = try_insert_client_supabase(payload)
+                        if saved:
+                            client_saved = True
+                            client_record = rec
+                            client_id = rec.get("id") if rec else None
+                        else:
+                            save_outbox(payload, {"backend_status": resp.status_code, "backend_text": getattr(resp, "text", ""), "fallback_info": info})
+                            st.warning("Recebemos seus dados. Estamos guardando e tentaremos processar em seguida.")
+                except ConnectionError:
+                    # backend indisponível -> tenta salvar direto no Supabase
                     saved, info, rec = try_insert_client_supabase(payload)
                     if saved:
                         client_saved = True
                         client_record = rec
                         client_id = rec.get("id") if rec else None
                     else:
-                        save_outbox(payload, {"backend_status": resp.status_code, "backend_text": getattr(resp, "text", ""), "fallback_info": info})
-                        st.warning("Recebemos seus dados. Estamos guardando e tentaremos processar em seguida.")
-            except ConnectionError:
-                # backend indisponível -> tenta salvar direto no Supabase
+                        save_outbox(payload, {"error": "connection_refused", "fallback_info": info})
+                        st.warning("Serviço temporariamente indisponível. Seus dados foram recebidos e serão processados em breve.")
+                except RequestException:
+                    save_outbox(payload, {"error": "request_exception"})
+                    st.warning("Problema de rede. Seus dados foram salvos e serão reenviados automaticamente.")
+                except Exception:
+                    save_outbox(payload, {"error": "unexpected"})
+                    st.error("Ocorreu um problema. Seus dados foram salvos com segurança e serão verificados.")
+            else:
+                # sem URL configurada -> tenta salvar direto no Supabase
                 saved, info, rec = try_insert_client_supabase(payload)
                 if saved:
                     client_saved = True
                     client_record = rec
                     client_id = rec.get("id") if rec else None
                 else:
-                    save_outbox(payload, {"error": "connection_refused", "fallback_info": info})
-                    st.warning("Serviço temporariamente indisponível. Seus dados foram recebidos e serão processados em breve.")
-            except RequestException:
-                save_outbox(payload, {"error": "request_exception"})
-                st.warning("Problema de rede. Seus dados foram salvos e serão reenviados automaticamente.")
-            except Exception:
-                save_outbox(payload, {"error": "unexpected"})
-                st.error("Ocorreu um problema. Seus dados foram salvos com segurança e serão verificados.")
-        elif dry_run:
-            st.json({"dry_run": True, "normalized_payload": payload})
-            client_saved = False
-        else:
-            # sem URL configurada -> tenta salvar direto no Supabase
-            saved, info, rec = try_insert_client_supabase(payload)
-            if saved:
-                client_saved = True
-                client_record = rec
-                client_id = rec.get("id") if rec else None
-            else:
-                save_outbox(payload, {"error": "no_api_url", "fallback_info": info})
-                st.warning("Registro salvo localmente. Configure API_BASE_URL ou verifique conexão para processar.")
+                    save_outbox(payload, {"error": "no_api_url", "fallback_info": info})
+                    st.warning("Registro salvo localmente. Configure API_BASE_URL ou verifique conexão para processar.")
 
         # Se foi criado/registrado com sucesso e o usuário pediu ação imediata, cria a ação
         action_created = False
