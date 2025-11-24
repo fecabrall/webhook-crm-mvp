@@ -7,8 +7,15 @@ from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from services.database_service import get_clients_for_automation, update_client_status
+from services.database_service import (
+    get_clients_for_automation, 
+    update_client_status,
+    get_clients_needing_action,
+    insert_action,
+    update_client_next_action
+)
 from services.whatsapp_service import send_follow_up_message
+from datetime import datetime, timedelta
 
 # Configuração de logging
 logger = logging.getLogger(__name__)
@@ -67,18 +74,19 @@ def job_diario_de_automacao():
     logger.info("=" * 50)
     
     try:
-        # 1. Busca clientes para processar
-        clients, error = get_clients_for_automation()
+        # 1. Busca clientes que precisam de ação (baseado em data_primeira_compra)
+        # Padrão: 7 dias após a compra
+        clients, error = get_clients_needing_action(days_after_purchase=7)
         
         if error:
             logger.error(f"❌ Erro ao buscar clientes: {error}")
             return
         
         if not clients:
-            logger.info("ℹ️ Nenhum cliente encontrado para processar")
+            logger.info("ℹ️ Nenhum cliente encontrado que precise de ação hoje")
             return
         
-        logger.info(f"📊 Total de clientes encontrados: {len(clients)}")
+        logger.info(f"📊 Total de clientes que precisam de ação: {len(clients)}")
         
         # 2. Processa cada cliente
         sucessos = 0
@@ -88,33 +96,57 @@ def job_diario_de_automacao():
             client_id = client.get('id')
             client_nome = client.get('nome', 'Cliente sem nome')
             client_status = client.get('status', '')
+            data_compra = client.get('data_primeira_compra')
             
             logger.info(f"\n📧 Processando cliente: {client_nome} (ID: {client_id})")
             
-            # Verifica se o cliente já recebeu mensagem de acompanhamento
-            # (evita spam - você pode ajustar essa lógica)
-            if 'Acompanhamento enviado' in client_status:
-                logger.info(f"⏭️ Cliente {client_nome} já recebeu acompanhamento. Pulando...")
+            # 3. Cria registro de ação pendente
+            acao_data = {
+                'id_cliente': client_id,
+                'tipo': 'mensagem',
+                'conteudo': f'Mensagem de acompanhamento automática para {client_nome}',
+                'resultado': 'pendente',
+                'data': datetime.now().isoformat()
+            }
+            
+            acao_criada, erro_acao = insert_action(acao_data)
+            if not acao_criada:
+                logger.error(f"❌ Erro ao criar ação para {client_nome}: {erro_acao}")
+                falhas += 1
                 continue
             
-            # 3. Envia mensagem de follow-up
+            # 4. Envia mensagem de follow-up
             sucesso, erro = send_follow_up_message(client)
             
             if sucesso:
                 sucessos += 1
-                # 4. Atualiza status do cliente
-                novo_status = f"{client_status} | Acompanhamento enviado em {datetime.now().strftime('%d/%m/%Y')}"
-                update_success, update_error = update_client_status(client_id, novo_status)
+                # 5. Atualiza a ação como concluída
+                update_action_result(acao_criada['id'], 'sim')
                 
-                if update_success:
-                    logger.info(f"✅ Cliente {client_nome} processado com sucesso")
-                else:
-                    logger.warning(f"⚠️ Mensagem enviada, mas falha ao atualizar status: {update_error}")
+                # 6. Atualiza status do cliente e próxima ação
+                novo_status = f"{client_status} | Acompanhamento enviado em {datetime.now().strftime('%d/%m/%Y')}"
+                update_client_status(client_id, novo_status)
+                
+                # Agenda próxima ação (14 dias após a compra)
+                if data_compra:
+                    try:
+                        if isinstance(data_compra, str):
+                            data_compra_obj = datetime.fromisoformat(data_compra.replace('Z', '+00:00'))
+                        else:
+                            data_compra_obj = data_compra
+                        proxima_acao = (data_compra_obj + timedelta(days=14)).isoformat()
+                        update_client_next_action(client_id, proxima_acao)
+                    except Exception as e:
+                        logger.warning(f"⚠️ Erro ao calcular próxima ação: {e}")
+                
+                logger.info(f"✅ Cliente {client_nome} processado com sucesso")
             else:
                 falhas += 1
+                # Marca ação como falha
+                update_action_result(acao_criada['id'], 'sem_resposta')
                 logger.error(f"❌ Falha ao enviar mensagem para {client_nome}: {erro}")
         
-        # 5. Resumo final
+        # 7. Resumo final
         logger.info("\n" + "=" * 50)
         logger.info("📈 RESUMO DA AUTOMAÇÃO DIÁRIA")
         logger.info(f"✅ Sucessos: {sucessos}")
