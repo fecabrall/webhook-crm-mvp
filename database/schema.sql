@@ -20,7 +20,8 @@ BEGIN
         ADD COLUMN IF NOT EXISTS valor_pago NUMERIC(10,2) CHECK (valor_pago >= 0),
         ADD COLUMN IF NOT EXISTS proxima_acao TIMESTAMPTZ,
         ADD COLUMN IF NOT EXISTS ultima_acao TIMESTAMPTZ,
-        ADD COLUMN IF NOT EXISTS observacoes TEXT;
+        ADD COLUMN IF NOT EXISTS observacoes TEXT,
+        ADD COLUMN IF NOT EXISTS cpf VARCHAR(11);
     ELSE
         RAISE NOTICE 'Tabela clientes não existe — pulei adição de colunas.';
     END IF;
@@ -108,6 +109,26 @@ END $$;
 
 CREATE INDEX IF NOT EXISTS idx_clientes_data_compra ON clientes(data_primeira_compra) 
     WHERE data_primeira_compra IS NOT NULL;
+
+-- Índice/constraint para CPF (único quando presente)
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'clientes' AND column_name = 'cpf') THEN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint c JOIN pg_class t ON c.conrelid = t.oid
+            WHERE c.conname = 'uniq_clientes_cpf' AND t.relname = 'clientes'
+        ) THEN
+            ALTER TABLE clientes ADD CONSTRAINT uniq_clientes_cpf UNIQUE (cpf);
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_class WHERE relname = 'idx_clientes_cpf'
+        ) THEN
+            CREATE INDEX idx_clientes_cpf ON clientes(cpf);
+        END IF;
+    ELSE
+        RAISE NOTICE 'Coluna clientes.cpf não encontrada — pulei criação de índice/constraint.';
+    END IF;
+END $$;
 
 -- ============================================
 -- 4. TABELA DE AUDITORIA (LOGS)

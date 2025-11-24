@@ -19,7 +19,7 @@ def insert_new_client(data: dict) -> tuple:
     try:
         allowed = {
             'nome','telefone','email','status','data_primeira_compra',
-            'procedimento','valor_pago','proxima_acao','observacoes','ultima_acao'
+            'procedimento','valor_pago','proxima_acao','observacoes','ultima_acao','cpf'
         }
         payload = {k: v for k, v in data.items() if k in allowed}
         response = supabase.table('clientes').insert(payload).execute()
