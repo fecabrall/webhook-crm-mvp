@@ -19,7 +19,7 @@ def insert_new_client(data: dict) -> tuple:
     try:
         allowed = {
             'nome','telefone','email','status','data_primeira_compra',
-            'procedimento','valor_pago','proxima_acao','observacoes'
+            'procedimento','valor_pago','proxima_acao','observacoes','ultima_acao'
         }
         payload = {k: v for k, v in data.items() if k in allowed}
         response = supabase.table('clientes').insert(payload).execute()
@@ -190,7 +190,8 @@ def get_clients_needing_action(days_after_purchase: int = 7) -> tuple:
         # 1. Têm data_primeira_compra
         # 2. A data_primeira_compra + days_after_purchase <= hoje
         # 3. Não têm próxima_acao agendada OU próxima_acao <= hoje
-        response = supabase.table('clientes').select('*').gte('data_primeira_compra', str(data_limite)).execute()
+        # Seleciona clientes cuja data_primeira_compra <= data_limite (compras antigas)
+        response = supabase.table('clientes').select('*').lte('data_primeira_compra', str(data_limite)).execute()
         
         # Filtra clientes que realmente precisam de ação
         clientes_que_precisam = []
@@ -203,8 +204,16 @@ def get_clients_needing_action(days_after_purchase: int = 7) -> tuple:
                 
             # Converte string para date
             if isinstance(data_compra_str, str):
-                from datetime import datetime as dt
-                data_compra = dt.fromisoformat(data_compra_str.replace('Z', '+00:00')).date()
+                try:
+                    # tenta ISO first
+                    data_compra = datetime.fromisoformat(data_compra_str.replace('Z', '+00:00')).date()
+                except Exception:
+                    # tenta dd/mm/YYYY
+                    try:
+                        from datetime import datetime as _dt
+                        data_compra = _dt.strptime(data_compra_str, '%d/%m/%Y').date()
+                    except Exception:
+                        continue
             else:
                 data_compra = data_compra_str
             
@@ -212,8 +221,16 @@ def get_clients_needing_action(days_after_purchase: int = 7) -> tuple:
             dias_desde_compra = (hoje - data_compra).days
             if dias_desde_compra >= days_after_purchase:
                 proxima_acao = cliente.get('proxima_acao')
-                if not proxima_acao or (isinstance(proxima_acao, str) and dt.fromisoformat(proxima_acao.replace('Z', '+00:00')).date() <= hoje):
+                if not proxima_acao:
                     clientes_que_precisam.append(cliente)
+                else:
+                    try:
+                        pa_date = datetime.fromisoformat(str(proxima_acao).replace('Z', '+00:00')).date()
+                        if pa_date <= hoje:
+                            clientes_que_precisam.append(cliente)
+                    except Exception:
+                        # se não conseguiu parsear, considera que precisa de atenção
+                        clientes_que_precisam.append(cliente)
         
         return clientes_que_precisam, None
     except Exception as e:

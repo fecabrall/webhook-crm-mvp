@@ -123,6 +123,20 @@ def receive_webhook():
             logger.warning(f"Erro ao calcular próxima ação: {e}")
             proxima_acao = None
 
+    # --- Aceita campo 'ultima_acao' se enviado ---
+    ultima_acao = data.get('ultima_acao')
+    if ultima_acao:
+        try:
+            # aceita formatos: 'dd/mm/YYYY' ou ISO
+            if isinstance(ultima_acao, str) and '/' in ultima_acao:
+                from datetime import datetime as _dt
+                ultima_acao = _dt.strptime(ultima_acao, '%d/%m/%Y').isoformat()
+            else:
+                ultima_acao = datetime.fromisoformat(str(ultima_acao)).isoformat()
+        except Exception as e:
+            logger.warning(f"Formato de ultima_acao inválido: {ultima_acao} - {e}")
+            ultima_acao = None
+
     # Valor pago
     if valor_pago is not None:
         try:
@@ -140,6 +154,7 @@ def receive_webhook():
         "procedimento": procedimento,
         "valor_pago": valor_pago,
         "proxima_acao": proxima_acao,
+        "ultima_acao": ultima_acao,
         "observacoes": observacoes
     }
 
