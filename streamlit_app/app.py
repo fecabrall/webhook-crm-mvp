@@ -4,7 +4,7 @@ from supabase import create_client, Client
 import requests
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from requests.exceptions import ConnectionError, RequestException
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
@@ -41,14 +41,24 @@ OUTBOX_PATH = os.path.join(os.getcwd(), "streamlit_pending_webhooks.jsonl")
 
 # --- FUNÇÕES AUXILIARES DE FORMATAÇÃO ---
 def pretty_datetime(val):
+    """Formata datetime para padrão brasileiro"""
     if not val:
         return ""
     try:
         dt = pd.to_datetime(val)
-        return dt.tz_convert(None).strftime("%Y-%m-%d %H:%M")
+        return dt.tz_convert(None).strftime("%d/%m/%Y %H:%M")
     except Exception:
         return str(val)
 
+def pretty_date(val):
+    """Formata date para padrão brasileiro"""
+    if not val:
+        return ""
+    try:
+        dt = pd.to_datetime(val)
+        return dt.strftime("%d/%m/%Y")
+    except Exception:
+        return str(val)
 
 def mask_cpf(cpf: str) -> str:
     if not cpf:
@@ -90,21 +100,6 @@ def save_outbox(record_payload, meta=None):
     except Exception:
         return False
 
-def try_save_to_supabase(record_payload):
-    if not supabase:
-        return False, "no_supabase_client"
-    try:
-        resp = supabase.table("clientes").insert(record_payload).execute()
-        data = getattr(resp, "data", None)
-        err = getattr(resp, "error", None)
-        if data:
-            return True, "saved_supabase"
-        if err:
-            return False, f"supabase_error:{err}"
-        return False, "supabase_unknown"
-    except Exception as e:
-        return False, f"supabase_exception:{e}"
-
 def try_insert_client_supabase(record_payload):
     """Insere cliente no Supabase e retorna (success, info, record_or_none)"""
     if not supabase:
@@ -120,7 +115,6 @@ def try_insert_client_supabase(record_payload):
         return False, "supabase_unknown", None
     except Exception as e:
         return False, f"supabase_exception:{e}", None
-
 
 def try_insert_action_supabase(action_payload):
     """Insere ação na tabela 'acoes' e retorna (success, info, record_or_none)"""
@@ -138,66 +132,9 @@ def try_insert_action_supabase(action_payload):
     except Exception as e:
         return False, f"supabase_exception:{e}", None
 
-def resend_outbox_once(api_base=None, token=None):
-    if not os.path.exists(OUTBOX_PATH):
-        return {"processed": 0, "left": 0}
-    retained = []
-    processed = 0
-    try:
-        with open(OUTBOX_PATH, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-    except Exception:
-        return {"processed": 0, "left": 0}
-    for ln in lines:
-        try:
-            rec = json.loads(ln)
-            payload = rec.get("payload", {})
-        except Exception:
-            continue
-        sent = False
-        # try backend if provided
-        if api_base:
-            try:
-                headers = {"Content-Type": "application/json"}
-                if token:
-                    headers["Authorization"] = f"Bearer {token}"
-                r = requests.post(api_base.rstrip("/") + "/api/webhook", json=payload, headers=headers, timeout=8)
-                if r.status_code in (200, 201):
-                    processed += 1
-                    sent = True
-                else:
-                    # not successful -> try supabase
-                    saved, info = try_save_to_supabase(payload)
-                    if saved:
-                        processed += 1
-                        sent = True
-            except Exception:
-                pass
-        if not sent:
-            # try direct supabase
-            saved, info = try_save_to_supabase(payload)
-            if saved:
-                processed += 1
-                sent = True
-        if not sent:
-            retained.append(rec)
-    # rewrite leftover
-    try:
-        if retained:
-            with open(OUTBOX_PATH, "w", encoding="utf-8") as f:
-                for r in retained:
-                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        else:
-            os.remove(OUTBOX_PATH)
-    except Exception:
-        pass
-    return {"processed": processed, "left": len(retained)}
-
-
 def resend_single_outbox_record(rec, api_base=None, token=None):
     """Try to resend a single outbox record. Returns (success, info)."""
     payload = rec.get("payload", {})
-    # try backend first
     if api_base:
         try:
             headers = {"Content-Type": "application/json"}
@@ -209,13 +146,11 @@ def resend_single_outbox_record(rec, api_base=None, token=None):
         except Exception:
             pass
 
-    # try direct supabase
     saved, info, rec_saved = try_insert_client_supabase(payload)
     if saved:
         return True, f"saved_supabase:{rec_saved.get('id') if rec_saved else ''}"
 
     return False, info
-
 
 def remove_outbox_entry_by_index(idx):
     """Remove a single outbox entry by its index (0-based)."""
@@ -236,31 +171,32 @@ def remove_outbox_entry_by_index(idx):
     except Exception:
         return False
 
-# Tenta re-enviar uma vez ao iniciar (silencioso)
-API_BASE_START = st.secrets.get("API_BASE_URL") if "API_BASE_URL" in st.secrets else os.getenv("API_BASE_URL", None)
-API_TOKEN_START = st.secrets.get("API_SECRET_TOKEN") if "API_SECRET_TOKEN" in st.secrets else os.getenv("API_SECRET_TOKEN", None)
-if API_BASE_START or supabase:
-    _res = resend_outbox_once(api_base=API_BASE_START, token=API_TOKEN_START)
-    if _res.get("processed", 0) > 0:
-        st.info(f"{_res['processed']} registro(s) pendentes processados automaticamente.")
-
 # --- LAYOUT: Abas ---
-st.title("🚀 Painel de Controle - MVP Automação")
-tabs = st.tabs(["Visão Geral", "Enviar Webhook (form)", "Tarefas / Ações", "Pendentes / Outbox", "Logs / Auditoria"])
+st.title("🚀 Painel de Controle - MVP CRM")
+tabs = st.tabs(["📊 Visão Geral", "📝 Cadastro de Cliente", "✅ Tarefas Pendentes", "📥 Envios Pendentes", "📜 Auditoria"])
 
 # ----- ABA 1: Visão Geral -----
 with tabs[0]:
-    st.header("📋 Visão Geral")
+    st.header("📊 Visão Geral de Clientes")
+    
     df_clientes = get_table("clientes")
+    
     if not df_clientes.empty:
-        for col in ["data_primeira_compra", "proxima_acao", "ultima_acao"]:
-            if col in df_clientes.columns:
-                df_clientes[col + "_pretty"] = df_clientes[col].apply(pretty_datetime)
+        # Formata datas
         if "data_primeira_compra" in df_clientes.columns:
-            df_clientes["dias_desde_compra"] = df_clientes["data_primeira_compra"].apply(days_since)
-        # format cpf for display (masked)
+            df_clientes["DATA DA PRIMEIRA COMPRA"] = df_clientes["data_primeira_compra"].apply(pretty_date)
+            df_clientes["DIAS DESDE A COMPRA ANTERIOR"] = df_clientes["data_primeira_compra"].apply(days_since)
+        
+        if "proxima_acao" in df_clientes.columns:
+            df_clientes["PRÓXIMA AÇÃO"] = df_clientes["proxima_acao"].apply(pretty_datetime)
+        
+        if "ultima_acao" in df_clientes.columns:
+            df_clientes["ÚLTIMA AÇÃO"] = df_clientes["ultima_acao"].apply(pretty_datetime)
+        
         if 'cpf' in df_clientes.columns:
-            df_clientes['cpf_pretty'] = df_clientes['cpf'].apply(mask_cpf)
+            df_clientes['CPF'] = df_clientes['cpf'].apply(mask_cpf)
+        
+        # Define status da ação
         def precisa_acao(row):
             pa = row.get("proxima_acao")
             if not pa:
@@ -268,364 +204,512 @@ with tabs[0]:
             try:
                 pa_date = pd.to_datetime(pa)
                 if pa_date <= pd.Timestamp.now():
-                    return "Hoje / Atrasado"
-                return "Agendado"
+                    return "⚠️ Hoje/Atrasado"
+                return "✅ Agendado"
             except Exception:
                 return "Desconhecido"
-        df_clientes["status_acao"] = df_clientes.apply(precisa_acao, axis=1)
-
+        
+        df_clientes["STATUS DA AÇÃO"] = df_clientes.apply(precisa_acao, axis=1)
+        
+        # Métricas
         col1, col2, col3 = st.columns(3)
-        col1.metric("Total de Clientes", len(df_clientes))
-        col2.metric("Com próxima ação hoje/atrasada", int((df_clientes['status_acao']=="Hoje / Atrasado").sum()))
-        col3.metric("Sem próxima ação", int((df_clientes['status_acao']=="Sem agenda").sum()))
-
-        display_cols = ["id", "nome", "cpf_pretty", "telefone", "status", "data_primeira_compra_pretty",
-                "dias_desde_compra", "proxima_acao_pretty", "ultima_acao_pretty", "status_acao", "observacoes"]
+        col1.metric("📊 Total de Clientes", len(df_clientes))
+        col2.metric("⚠️ Ação Hoje/Atrasada", int((df_clientes['STATUS DA AÇÃO']=="⚠️ Hoje/Atrasado").sum()))
+        col3.metric("📅 Sem Próxima Ação", int((df_clientes['STATUS DA AÇÃO']=="Sem agenda").sum()))
+        
+        st.markdown("---")
+        
+        # Renomeia colunas para exibição
+        rename_map = {
+            "id": "ID",
+            "nome": "NOME",
+            "telefone": "TELEFONE",
+            "email": "EMAIL",
+            "status": "STATUS",
+            "procedimento": "PROCEDIMENTO",
+            "valor_pago": "VALOR PAGO",
+            "observacoes": "OBSERVAÇÕES"
+        }
+        
+        # Seleciona colunas para exibir
+        display_cols = ["ID", "NOME", "CPF", "TELEFONE", "EMAIL", "STATUS", 
+                       "DATA DA PRIMEIRA COMPRA", "DIAS DESDE A COMPRA ANTERIOR",
+                       "PROCEDIMENTO", "VALOR PAGO", "PRÓXIMA AÇÃO", "ÚLTIMA AÇÃO", 
+                       "STATUS DA AÇÃO", "OBSERVAÇÕES"]
+        
+        # Remove colunas que não existem
         display_cols = [c for c in display_cols if c in df_clientes.columns]
-        st.dataframe(df_clientes[display_cols].rename(columns=lambda x: x.replace("_pretty", "")), use_container_width=True)
+        
+        # Renomeia colunas originais
+        for old, new in rename_map.items():
+            if old in df_clientes.columns:
+                df_clientes[new] = df_clientes[old]
+        
+        st.dataframe(
+            df_clientes[display_cols],
+            use_container_width=True,
+            hide_index=True
+        )
     else:
-        st.info("Nenhum cliente encontrado no banco de dados ainda.")
+        st.info("ℹ️ Nenhum cliente encontrado no banco de dados ainda.")
 
-# ----- ABA 2: Enviar Webhook (form) -----
+# ----- ABA 2: Cadastro de Cliente -----
 with tabs[1]:
-    st.header("📨 Enviar novo cliente")
-    st.markdown("Formulário amigável para cadastrar clientes. O sistema tentará enviar ao backend; se indisponível, salva direto no banco; se necessário, guarda localmente para reenvio automático.")
-    # Tipo de cliente e busca por CPF (fora do form para autocomplete)
-    cliente_tipo = st.radio("Tipo de cliente", ("Novo", "Existente"), index=0, horizontal=True)
-    cpf_search = None
-    prefill = st.session_state.get("prefill_client", {})
-    if cliente_tipo == "Existente":
-        cols_search = st.columns([2,1])
-        cpf_search = cols_search[0].text_input("CPF (apenas números)", value=prefill.get("cpf",""))
-        if cols_search[1].button("Buscar por CPF"):
+    st.header("📝 Cadastro de Cliente")
+    
+    # Tipo de cadastro
+    tipo_cadastro = st.radio(
+        "Tipo de cadastro:",
+        ("🆕 Novo Cliente", "👤 Cliente Existente"),
+        horizontal=True
+    )
+    
+    # Inicializa dados do formulário
+    if 'form_data' not in st.session_state:
+        st.session_state.form_data = {}
+    
+    # Para cliente existente - busca por CPF
+    if tipo_cadastro == "👤 Cliente Existente":
+        st.markdown("### 🔍 Buscar Cliente por CPF")
+        col_search, col_btn = st.columns([3, 1])
+        
+        with col_search:
+            cpf_busca = st.text_input(
+                "CPF (apenas números)",
+                placeholder="12345678901",
+                key="cpf_search"
+            )
+        
+        with col_btn:
+            st.markdown("<br>", unsafe_allow_html=True)
+            buscar = st.button("🔍 Buscar", use_container_width=True)
+        
+        if buscar and cpf_busca:
             from utils.validators import sanitize_cpf, validate_cpf
-            cpf_digits = sanitize_cpf(cpf_search)
+            cpf_digits = sanitize_cpf(cpf_busca)
             ok, err = validate_cpf(cpf_digits)
+            
             if not ok:
-                st.error(f"CPF inválido: {err}")
+                st.error(f"❌ CPF inválido: {err}")
             else:
-                # procura no Supabase por cpf
                 try:
                     resp = supabase.table('clientes').select('*').eq('cpf', cpf_digits).limit(1).execute()
                     data = getattr(resp, 'data', None) or []
+                    
                     if data:
-                        client = data[0]
-                        st.session_state['prefill_client'] = client
-                        st.experimental_rerun()
+                        st.session_state.form_data = data[0]
+                        st.success(f"✅ Cliente encontrado: {data[0].get('nome')}")
                     else:
-                        st.info("Cliente não encontrado. Preencha os dados manualmente.")
+                        st.warning("⚠️ Cliente não encontrado. Preencha os dados manualmente.")
+                        st.session_state.form_data = {'cpf': cpf_digits}
                 except Exception as e:
-                    st.error(f"Erro na busca: {e}")
-
-    with st.form("webhook_form"):
-        # prefill values if present
-        nome = st.text_input("Nome completo", value=prefill.get("nome",""))
-        telefone = st.text_input("Telefone", value=prefill.get("telefone",""))
-        email = st.text_input("Email (opcional)", value=prefill.get("email",""))
-
-        status_options = ["Novo Cliente - 1 compra", "Em follow-up", "Recorrente", "Perdido", "Outro..."]
-        status_sel = st.selectbox("Status (padrões)", status_options, index=0)
+                    st.error(f"❌ Erro na busca: {e}")
+        
+        st.markdown("---")
+    
+    # Formulário de cadastro
+    with st.form("cadastro_form", clear_on_submit=False):
+        st.markdown("### 📋 Dados do Cliente")
+        
+        # Dados do formulário preenchidos se existirem
+        form_data = st.session_state.form_data
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            nome = st.text_input(
+                "Nome *",
+                value=form_data.get("nome", ""),
+                placeholder="João"
+            )
+            
+            telefone = st.text_input(
+                "Telefone *",
+                value=form_data.get("telefone", ""),
+                placeholder="11999999999"
+            )
+            
+            cpf = st.text_input(
+                "CPF *",
+                value=form_data.get("cpf", ""),
+                placeholder="12345678901"
+            )
+            
+            data_compra = st.date_input(
+                "Data da Compra *" if tipo_cadastro == "👤 Cliente Existente" else "Data da 1ª Compra *",
+                value=None
+            )
+        
+        with col2:
+            sobrenome = st.text_input(
+                "Sobrenome *",
+                value=form_data.get("sobrenome", ""),
+                placeholder="Silva"
+            )
+            
+            email = st.text_input(
+                "Email",
+                value=form_data.get("email", ""),
+                placeholder="joao.silva@email.com"
+            )
+            
+            procedimento = st.text_input(
+                "Procedimento",
+                value=form_data.get("procedimento", ""),
+                placeholder="Consulta, limpeza, etc."
+            )
+            
+            valor_pago = st.number_input(
+                "Valor Pago (R$)",
+                min_value=0.0,
+                step=0.01,
+                format="%.2f",
+                value=float(form_data.get("valor_pago", 0.0))
+            )
+        
+        # Status
+        status_options = [
+            "Novo Cliente - 1ª compra",
+            "Cliente Recorrente",
+            "Em Acompanhamento",
+            "Inativo",
+            "Outro..."
+        ]
+        
+        status_sel = st.selectbox(
+            "Status",
+            status_options,
+            index=0
+        )
+        
         if status_sel == "Outro...":
-            status = st.text_input("Status personalizado")
+            status_custom = st.text_input(
+                "Especifique o status:",
+                placeholder="Ex: Cliente VIP, Aguardando retorno, etc."
+            )
+            status = status_custom if status_custom else "Outro"
         else:
             status = status_sel
-
-        # Data label changes for novo/existente
-        if cliente_tipo == "Novo":
-            data_compra = st.date_input("Data da primeira compra", value=None)
-        else:
-            data_compra = st.date_input("Data desta compra", value=None)
-        procedimento = st.text_input("Procedimento", "")
-        valor_pago = st.number_input("Valor pago", min_value=0.0, step=0.01, format="%.2f")
-        observacoes = st.text_area("Observações", value=prefill.get("observacoes",""))
-
-        # show CPF in form for existing as read-only if prefilled
-        if cliente_tipo == "Existente":
-            cpf_display = prefill.get('cpf', cpf_search or "")
-            st.text_input("CPF (identificador)", value=cpf_display, disabled=True)
-
+        
+        # Observações
+        observacoes = st.text_area(
+            "Observações",
+            value=form_data.get("observacoes", ""),
+            placeholder="Informações adicionais sobre o cliente..."
+        )
+        
         st.markdown("---")
-        st.subheader("Agendamento")
-        proxima_manual = st.checkbox("Definir próxima ação manualmente")
+        st.markdown("### 📅 Agendamento")
+        
+        agendar_proxima = st.checkbox("Definir próxima ação manualmente")
         proxima_acao_dt = None
-        if proxima_manual:
-            proxima_acao_dt = st.datetime_input("Próxima ação (data e hora)", value=None)
-
+        
+        if agendar_proxima:
+            col_data, col_hora = st.columns(2)
+            with col_data:
+                proxima_data = st.date_input("Data da próxima ação", value=None)
+            with col_hora:
+                proxima_hora = st.time_input("Horário", value=None)
+            
+            if proxima_data and proxima_hora:
+                proxima_acao_dt = datetime.combine(proxima_data, proxima_hora)
+        
         st.markdown("---")
-        st.subheader("Ações imediatas (opcional)")
+        st.markdown("### ⚡ Ações Imediatas")
+        
         criar_acao = st.checkbox("Criar ação agora para este cliente")
         acao_tipo = None
         acao_conteudo = None
         acao_resultado = "pendente"
+        
         if criar_acao:
-            acao_tipo = st.selectbox("Tipo de ação", ("ligacao", "mensagem"))
-            acao_conteudo = st.text_area("Conteúdo / Observações da ação")
-            acao_resultado = st.selectbox("Resultado inicial", ("pendente", "sem_resposta", "agendou", "comprou", "sim", "nao"), index=0)
-
-        dry_run = st.checkbox("Dry-run (não persiste no DB, devolve payload normalizado)", value=False)
-        submitted = st.form_submit_button("Enviar")
-
+            col_tipo, col_resultado = st.columns(2)
+            
+            with col_tipo:
+                acao_tipo = st.selectbox(
+                    "Tipo de ação",
+                    ("📞 Ligação", "💬 Mensagem"),
+                    format_func=lambda x: x
+                )
+                acao_tipo = "ligacao" if "Ligação" in acao_tipo else "mensagem"
+            
+            with col_resultado:
+                acao_resultado = st.selectbox(
+                    "Status inicial",
+                    [
+                        ("⏳ Pendente", "pendente"),
+                        ("✅ Realizado", "sim"),
+                        ("❌ Não atendeu", "sem_resposta"),
+                        ("📅 Agendou", "agendou"),
+                        ("💰 Comprou", "comprou")
+                    ],
+                    format_func=lambda x: x[0]
+                )[1]
+            
+            acao_conteudo = st.text_area(
+                "Observações da ação",
+                placeholder="Descreva o que foi feito ou planejado..."
+            )
+        
+        st.markdown("---")
+        
+        # Botão de envio
+        col_btn1, col_btn2, col_btn3 = st.columns([2, 1, 1])
+        
+        with col_btn1:
+            submitted = st.form_submit_button(
+                "✅ Cadastrar Cliente",
+                use_container_width=True,
+                type="primary"
+            )
+        
+        with col_btn2:
+            limpar = st.form_submit_button(
+                "🗑️ Limpar",
+                use_container_width=True
+            )
+        
+        if limpar:
+            st.session_state.form_data = {}
+            st.rerun()
+    
     if submitted:
-        API_BASE = st.secrets.get("API_BASE_URL") if "API_BASE_URL" in st.secrets else os.getenv("API_BASE_URL", "http://localhost:5000")
-        TOKEN = st.secrets.get("API_SECRET_TOKEN") if "API_SECRET_TOKEN" in st.secrets else os.getenv("API_SECRET_TOKEN", "")
-        url = API_BASE.rstrip("/") + "/api/webhook" if API_BASE else None
-
-        payload = {
-            "nome": nome,
-            "telefone": telefone,
-            "email": email,
-            "status": status or "Novo Cliente - 1 compra",
-            "procedimento": procedimento,
-            "valor_pago": float(valor_pago) if valor_pago else None,
-            "observacoes": observacoes
-        }
-
-        # include cpf when available
-        cpf_field = prefill.get('cpf') if prefill.get('cpf') else (cpf_search or None)
-        # validate CPF if present (existing clients require valid CPF)
-        validation_failed = False
-        if cpf_field:
-            from utils.validators import sanitize_cpf, validate_cpf
-            cpf_digits = sanitize_cpf(cpf_field)
-            ok, err = validate_cpf(cpf_digits)
-            if not ok:
-                st.error(f"CPF inválido: {err}")
-                validation_failed = True
-        if cpf_field:
-            from utils.validators import sanitize_cpf
-            payload['cpf'] = sanitize_cpf(cpf_field)
-
-        if data_compra:
-            payload["data_primeira_compra"] = data_compra.strftime("%d/%m/%Y")
-
-        if proxima_acao_dt:
-            try:
-                payload["proxima_acao"] = proxima_acao_dt.isoformat()
-            except Exception:
-                payload["proxima_acao"] = None
-
-        # Se o usuário marcou criar ação agora, iremos tentar criar ação e atualizar ultima_acao
-        agora_iso = datetime.now().isoformat()
-        if criar_acao and not dry_run:
-            # marca que houve uma ação agora
-            payload["ultima_acao"] = agora_iso
-
-        headers = {"Content-Type": "application/json"}
-        if TOKEN:
-            headers["Authorization"] = f"Bearer {TOKEN}"
-        if dry_run:
-            headers["X-Dry-Run"] = "true"
-
-        # Envio/fluxo
-        client_saved = False
-        client_record = None
-        client_id = None
-
-        # 1) tenta enviar ao backend
-        if validation_failed:
-            st.warning("Corrija o CPF antes de enviar.")
+        # Validação básica
+        if not nome or not sobrenome or not telefone or not cpf:
+            st.error("❌ Por favor, preencha todos os campos obrigatórios (*).")
         else:
-            # dry-run path
-            if dry_run:
-                st.json({"dry_run": True, "normalized_payload": payload})
-                client_saved = False
-            # try backend when configured
-            elif url and not dry_run:
-                try:
-                    resp = requests.post(url, json=payload, headers=headers, timeout=10)
-                    if resp.status_code in (200, 201):
-                        client_saved = True
-                        try:
-                            j = resp.json()
-                            client_id = j.get("client_id")
-                        except Exception:
-                            client_id = None
-                    else:
-                        # backend respondeu com erro -> tenta salvar direto no Supabase
-                        saved, info, rec = try_insert_client_supabase(payload)
-                        if saved:
-                            client_saved = True
-                            client_record = rec
-                            client_id = rec.get("id") if rec else None
-                        else:
-                            save_outbox(payload, {"backend_status": resp.status_code, "backend_text": getattr(resp, "text", ""), "fallback_info": info})
-                            st.warning("Recebemos seus dados. Estamos guardando e tentaremos processar em seguida.")
-                except ConnectionError:
-                    # backend indisponível -> tenta salvar direto no Supabase
-                    saved, info, rec = try_insert_client_supabase(payload)
-                    if saved:
-                        client_saved = True
-                        client_record = rec
-                        client_id = rec.get("id") if rec else None
-                    else:
-                        save_outbox(payload, {"error": "connection_refused", "fallback_info": info})
-                        st.warning("Serviço temporariamente indisponível. Seus dados foram recebidos e serão processados em breve.")
-                except RequestException:
-                    save_outbox(payload, {"error": "request_exception"})
-                    st.warning("Problema de rede. Seus dados foram salvos e serão reenviados automaticamente.")
-                except Exception:
-                    save_outbox(payload, {"error": "unexpected"})
-                    st.error("Ocorreu um problema. Seus dados foram salvos com segurança e serão verificados.")
+            # Monta o payload
+            nome_completo = f"{nome} {sobrenome}"
+            
+            from utils.validators import sanitize_cpf, validate_cpf, sanitize_phone, validate_phone
+            
+            cpf_digits = sanitize_cpf(cpf)
+            cpf_ok, cpf_err = validate_cpf(cpf_digits)
+            
+            if not cpf_ok:
+                st.error(f"❌ CPF inválido: {cpf_err}")
             else:
-                # sem URL configurada -> tenta salvar direto no Supabase
-                saved, info, rec = try_insert_client_supabase(payload)
-                if saved:
-                    client_saved = True
-                    client_record = rec
-                    client_id = rec.get("id") if rec else None
+                telefone_limpo = sanitize_phone(telefone)
+                tel_ok, tel_err = validate_phone(telefone_limpo)
+                
+                if not tel_ok:
+                    st.error(f"❌ Telefone inválido: {tel_err}")
                 else:
-                    save_outbox(payload, {"error": "no_api_url", "fallback_info": info})
-                    st.warning("Registro salvo localmente. Configure API_BASE_URL ou verifique conexão para processar.")
+                    payload = {
+                        "nome": nome_completo,
+                        "telefone": telefone_limpo,
+                        "email": email if email else None,
+                        "cpf": cpf_digits,
+                        "status": status,
+                        "procedimento": procedimento if procedimento else None,
+                        "valor_pago": float(valor_pago) if valor_pago else None,
+                        "observacoes": observacoes if observacoes else None
+                    }
+                    
+                    if data_compra:
+                        payload["data_primeira_compra"] = data_compra.strftime("%Y-%m-%d")
+                    
+                    if proxima_acao_dt:
+                        payload["proxima_acao"] = proxima_acao_dt.isoformat()
+                    
+                    agora_iso = datetime.now().isoformat()
+                    if criar_acao:
+                        payload["ultima_acao"] = agora_iso
+                    
+                    # Tenta salvar
+                    saved, info, rec = try_insert_client_supabase(payload)
+                    
+                    if saved:
+                        st.success(f"✅ Cliente {nome_completo} cadastrado com sucesso!")
+                        
+                        # Cria ação se solicitado
+                        if criar_acao and rec:
+                            action_payload = {
+                                "id_cliente": rec.get("id"),
+                                "tipo": acao_tipo,
+                                "conteudo": acao_conteudo,
+                                "data": agora_iso,
+                                "resultado": acao_resultado
+                            }
+                            
+                            a_saved, a_info, a_rec = try_insert_action_supabase(action_payload)
+                            
+                            if a_saved:
+                                st.success("✅ Ação criada com sucesso!")
+                        
+                        # Limpa o formulário
+                        st.session_state.form_data = {}
+                        st.balloons()
+                    else:
+                        st.error(f"❌ Erro ao cadastrar cliente: {info}")
+                        save_outbox(payload)
 
-        # Se foi criado/registrado com sucesso e o usuário pediu ação imediata, cria a ação
-        action_created = False
-        if client_saved and criar_acao and not dry_run:
-            action_payload = {
-                "id_cliente": client_id,
-                "tipo": acao_tipo,
-                "conteudo": acao_conteudo,
-                "data": agora_iso,
-                "resultado": acao_resultado
-            }
-            a_saved, a_info, a_rec = try_insert_action_supabase(action_payload)
-            if a_saved:
-                action_created = True
-                # atualiza ultima_acao do cliente se tivermos id
-                try:
-                    if client_id:
-                        supabase.table('clientes').update({'ultima_acao': agora_iso}).eq('id', client_id).execute()
-                except Exception:
-                    pass
-
-        # If existing client and user filled a "data desta compra", create a purchase action and update client summary
-        if client_saved and cliente_tipo == "Existente" and data_compra and not dry_run:
-            try:
-                dt_str = data_compra.strftime('%Y-%m-%d')
-            except Exception:
-                dt_str = None
-            purchase_content = f"Procedimento: {procedimento} | Valor: {valor_pago} | Data: {dt_str}"
-            purchase_action = {
-                'id_cliente': client_id,
-                'tipo': 'compra',
-                'conteudo': purchase_content,
-                'data': agora_iso,
-                'resultado': 'comprou'
-            }
-            try:
-                try_insert_action_supabase(purchase_action)
-            except Exception:
-                pass
-            # update cliente resumo (procedimento, valor_pago, ultima_acao)
-            try:
-                upd = {}
-                if procedimento:
-                    upd['procedimento'] = procedimento
-                if valor_pago:
-                    upd['valor_pago'] = float(valor_pago)
-                upd['ultima_acao'] = agora_iso
-                if upd and client_id:
-                    supabase.table('clientes').update(upd).eq('id', client_id).execute()
-            except Exception:
-                pass
-
-        # Feedback amigável
-        if client_saved:
-            msg = "Cliente registrado com sucesso."
-            if action_created:
-                msg += " Ação criada."
-            st.success(msg)
-        else:
-            with st.expander("Dados enviados (cópia)"):
-                st.code(json.dumps(payload, ensure_ascii=False, indent=2))
-            if os.path.exists(OUTBOX_PATH):
-                st.info("Há registros pendentes. Eles serão reenviados automaticamente quando possível.")
-                if st.button("Tentar reenviar pendentes agora"):
-                    res = resend_outbox_once(api_base=API_BASE if API_BASE else None, token=TOKEN if TOKEN else None)
-                    st.info(f"Processados: {res.get('processed',0)} · Restantes: {res.get('left',0)}")
-
-# ----- ABA 3: Tarefas / Ações -----
+# ----- ABA 3: Tarefas Pendentes -----
 with tabs[2]:
-    st.header("📋 Tarefas / Ações Pendentes")
-    st.markdown("Lista de ações pendentes usada pelos operadores. Fonte: view `vw_acoes_pendentes`.")
+    st.header("✅ Tarefas e Ações Pendentes")
+    
     df_acoes = get_table("vw_acoes_pendentes", limit=500)
+    
     if not df_acoes.empty:
         if "data" in df_acoes.columns:
-            df_acoes["data_pretty"] = df_acoes["data"].apply(pretty_datetime)
-        st.dataframe(df_acoes[["id","cliente_nome","cliente_telefone","tipo","conteudo","data_pretty","tipo_descricao"]], use_container_width=True)
-        st.info("Para marcar resultado, use a interface administrativa ou crie endpoints que atualizem `acoes.resultado` via API.")
+            df_acoes["DATA/HORA"] = df_acoes["data"].apply(pretty_datetime)
+        
+        # Renomeia colunas
+        rename_map = {
+            "id": "ID",
+            "cliente_nome": "CLIENTE",
+            "cliente_telefone": "TELEFONE",
+            "tipo": "TIPO",
+            "conteudo": "DESCRIÇÃO",
+            "tipo_descricao": "STATUS"
+        }
+        
+        for old, new in rename_map.items():
+            if old in df_acoes.columns:
+                df_acoes[new] = df_acoes[old]
+        
+        # Adiciona ícones ao tipo
+        def formata_tipo(tipo):
+            if tipo == "mensagem":
+                return "💬 Mensagem"
+            elif tipo == "ligacao":
+                return "📞 Ligação"
+            return tipo
+        
+        if "TIPO" in df_acoes.columns:
+            df_acoes["TIPO"] = df_acoes["TIPO"].apply(formata_tipo)
+        
+        st.dataframe(
+            df_acoes[["ID", "CLIENTE", "TELEFONE", "TIPO", "DESCRIÇÃO", "DATA/HORA", "STATUS"]],
+            use_container_width=True,
+            hide_index=True
+        )
+        
+        st.info("💡 **Dica:** Para atualizar o resultado de uma ação, use a API ou adicione controles aqui.")
     else:
-        st.info("Nenhuma ação pendente encontrada.")
+        st.success("🎉 Nenhuma ação pendente! Você está em dia com as tarefas.")
 
-# ----- ABA 4: Pendentes / Outbox -----
+# ----- ABA 4: Envios Pendentes -----
 with tabs[3]:
-    st.header("📥 Pendentes / Outbox")
-    st.markdown("Lista de envios locais que não foram processados. Você pode reenviar individualmente ao backend ou remover entradas.")
+    st.header("📥 Envios Pendentes (Outbox)")
+    
     if not os.path.exists(OUTBOX_PATH):
-        st.info("Nenhum item pendente encontrado.")
+        st.success("✅ Nenhum envio pendente. Todos os dados foram sincronizados!")
     else:
         try:
             with open(OUTBOX_PATH, "r", encoding="utf-8") as f:
                 lines = f.readlines()
         except Exception as e:
-            st.error(f"Erro ao ler outbox: {e}")
+            st.error(f"❌ Erro ao ler outbox: {e}")
             lines = []
+        
+        if lines:
+            st.warning(f"⚠️ Existem {len(lines)} envio(s) pendente(s) aguardando sincronização.")
+            
+            for i, ln in enumerate(lines):
+                try:
+                    rec = json.loads(ln)
+                except Exception:
+                    rec = {"ts": "?", "payload": {}}
+                
+                ts = rec.get("ts", "?")
+                payload = rec.get("payload", {})
+                nome = payload.get('nome', payload.get('telefone', 'Desconhecido'))
+                
+                with st.expander(f"📋 Envio #{i+1} - {nome} ({ts})", expanded=False):
+                    st.json(payload)
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        if st.button(f"🔄 Reenviar", key=f"resend_{i}"):
+                            api_base = st.secrets.get("API_BASE_URL") if "API_BASE_URL" in st.secrets else os.getenv("API_BASE_URL", None)
+                            token = st.secrets.get("API_SECRET_TOKEN") if "API_SECRET_TOKEN" in st.secrets else os.getenv("API_SECRET_TOKEN", None)
+                            
+                            ok, info = resend_single_outbox_record(rec, api_base=api_base, token=token)
+                            
+                            if ok:
+                                removed = remove_outbox_entry_by_index(i)
+                                if removed:
+                                    st.success("✅ Reenviado e removido dos pendentes!")
+                                    st.rerun()
+                                else:
+                                    st.success("✅ Reenviado com sucesso!")
+                            else:
+                                st.error(f"❌ Falha ao reenviar: {info}")
+                    
+                    with col2:
+                        if st.button(f"🗑️ Remover", key=f"delete_{i}"):
+                            removed = remove_outbox_entry_by_index(i)
+                            if removed:
+                                st.success("✅ Item removido!")
+                                st.rerun()
+                            else:
+                                st.error("❌ Erro ao remover item.")
 
-        for i, ln in enumerate(lines):
-            try:
-                rec = json.loads(ln)
-            except Exception:
-                rec = {"ts": "?", "payload": {}}
-            ts = rec.get("ts", "?")
-            payload = rec.get("payload", {})
-            title = f"{i} — {ts} — {payload.get('nome', payload.get('telefone',''))}"
-            with st.expander(title, expanded=False):
-                st.json(payload)
-                cols = st.columns([1,1,1])
-                if cols[0].button(f"Reenviar {i}"):
-                    api_base = st.secrets.get("API_BASE_URL") if "API_BASE_URL" in st.secrets else os.getenv("API_BASE_URL", None)
-                    token = st.secrets.get("API_SECRET_TOKEN") if "API_SECRET_TOKEN" in st.secrets else os.getenv("API_SECRET_TOKEN", None)
-                    ok, info = resend_single_outbox_record(rec, api_base=api_base, token=token)
-                    if ok:
-                        removed = remove_outbox_entry_by_index(i)
-                        if removed:
-                            st.success("Reenviado e removido dos pendentes.")
-                        else:
-                            st.success("Reenviado; não foi possível remover o item local (verifique permissões).")
-                        st.experimental_rerun()
-                    else:
-                        st.error(f"Falha ao reenviar: {info}")
-                if cols[1].button(f"Apagar {i}"):
-                    removed = remove_outbox_entry_by_index(i)
-                    if removed:
-                        st.success("Item removido do outbox.")
-                        st.experimental_rerun()
-                    else:
-                        st.error("Falha ao remover o item.")
-                if cols[2].button(f"Salvar como arquivo {i}"):
-                    # export payload as file
-                    fn = f"pending_{i}.json"
-                    try:
-                        with open(fn, "w", encoding="utf-8") as f:
-                            json.dump(payload, f, ensure_ascii=False, indent=2)
-                        st.success(f"Salvo em {fn}")
-                    except Exception as e:
-                        st.error(f"Erro ao salvar arquivo: {e}")
-
-# ----- ABA 4: Logs / Auditoria -----
-with tabs[3]:
-    st.header("📜 Logs / Auditoria")
-    st.markdown("Mostra os últimos registros da tabela `auditoria` para rastrear alterações.")
+# ----- ABA 5: Auditoria -----
+with tabs[4]:
+    st.header("📜 Logs de Auditoria")
+    
     df_logs = get_table("auditoria", limit=200)
+    
     if not df_logs.empty:
+        if "data_operacao" in df_logs.columns:
+            df_logs["DATA/HORA"] = df_logs["data_operacao"].apply(pretty_datetime)
+        
+        # Função para encurtar JSON
         def short_json(x):
             try:
                 s = str(x)
-                return (s[:300] + "...") if len(s) > 300 else s
+                return (s[:100] + "...") if len(s) > 100 else s
             except Exception:
                 return str(x)
-        for c in ["dados_antigos","dados_novos"]:
+        
+        for c in ["dados_antigos", "dados_novos"]:
             if c in df_logs.columns:
-                df_logs[c] = df_logs[c].apply(short_json)
-        st.dataframe(df_logs[["data_operacao","tabela_afetada","operacao","id_registro","usuario","dados_novos"]], use_container_width=True)
+                df_logs[c + "_short"] = df_logs[c].apply(short_json)
+        
+        # Renomeia colunas
+        rename_map = {
+            "tabela_afetada": "TABELA",
+            "operacao": "OPERAÇÃO",
+            "id_registro": "ID REGISTRO",
+            "usuario": "USUÁRIO"
+        }
+        
+        for old, new in rename_map.items():
+            if old in df_logs.columns:
+                df_logs[new] = df_logs[old]
+        
+        # Adiciona cores às operações
+        def formata_operacao(op):
+            if op == "INSERT":
+                return "➕ INSERT"
+            elif op == "UPDATE":
+                return "✏️ UPDATE"
+            elif op == "DELETE":
+                return "🗑️ DELETE"
+            return op
+        
+        if "OPERAÇÃO" in df_logs.columns:
+            df_logs["OPERAÇÃO"] = df_logs["OPERAÇÃO"].apply(formata_operacao)
+        
+        st.dataframe(
+            df_logs[["DATA/HORA", "TABELA", "OPERAÇÃO", "ID REGISTRO", "USUÁRIO", "dados_novos_short"]].rename(columns={"dados_novos_short": "DADOS"}),
+            use_container_width=True,
+            hide_index=True
+        )
     else:
-        st.info("Nenhum log encontrado ou tabela `auditoria` não existe no projeto.")
+        st.info("ℹ️ Nenhum log de auditoria encontrado ou tabela 'auditoria' não existe.")
+
+# --- FOOTER ---
+st.markdown("---")
+st.markdown(
+    """
+    <div style='text-align: center; color: #666; padding: 20px;'>
+        <p>🚀 <b>MVP CRM & Automação</b> | Desenvolvido com ❤️ usando Streamlit</p>
+        <p style='font-size: 0.8em;'>© 2025 - Todos os direitos reservados</p>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
